@@ -4,6 +4,7 @@ local cjson = require "cjson"
 local jwt = require "resty.jwt"
 local re_gmatch = ngx.re.gmatch
 local ck = require "resty.cookie"
+local redis = require "resty.redis"
 
 function JwtOauthPlugin:new()
   JwtOauthPlugin.super.new(self, "jwt-oauth")
@@ -30,7 +31,7 @@ local function retrieve_token(conf)
 	if cookie then
 		local jwt_cookie,err = cookie:get(conf.cookie_name)
 		if jwt_cookie and jwt_cookie ~= "" then
-            return jwt_cookie
+            return jwt_cookie["access_token"]
 		end
     end
     local args = kong.request.get_query_arg(conf.uri_name)
@@ -51,48 +52,82 @@ end
 local function do_auth(token,key,conf)
   local jwt_obj = jwt:verify(key,token)
   if jwt_obj.verified == false then
+    kong.log.err(jwt_obj.reason)
     return nil
   end
-  if type(jwt_obj.payload.role) == 'string' then
-    if is_in_table(jwt_obj.payload.role,conf.roles) then
-	  return cjson.encode(jwt_obj)
+  if conf.single_device then
+	local red = redis:new()
+	red:set_timeouts(2000, 2000, 2000) -- 2 sec
+	local ok, err = red:connect(conf.redis_host, conf.redis_port)
+	if not ok then
+		kong.response.exit(500, { message = "can not connect to redis" })
+		return nil
 	end
-  end
-  if type(jwt_obj.payload.role) == 'table' then
-    for _,v in ipairs(jwt_obj.payload.role) do
-	  if is_in_table(v,conf.roles) then
-	    return cjson.encode(jwt_obj)
+    if conf.redis_pass then
+	local res, err = red:auth(conf.redis_pass)
+		if not res then
+			kong.response.exit(500, { message = "failed to authenticate redis" })
+			return nil
+		end
+	end
+	if conf.redis_db then
+		ok, err = red:select(conf.redis_db)
+		if not ok then
+			kong.log.err("failed to select redis_db")
+			return nil
+		end
+	end
+	local res, err = red:hmget(conf.redis_hash, "access-token-"..jwt_obj.payload.userId)
+	if res then
+	    if res ~= token then
+		kong.response.exit(401, { message = "只能同时登录一个设备" })
+		end
+	end
+	--set header
+	kong.service.request.set_headers({
+  ["X-User-Id"] = jwt_obj.payload.userId,
+  ["X-Role-Code"] = kong.request.get_header('rolecode')
+})
+  end   
+  if conf.need_role then
+	  if type(jwt_obj.payload.role) == 'string' then
+		if is_in_table(jwt_obj.payload.role,conf.roles) then
+		  return jwt_obj.reason
+		end
 	  end
-	end
+	  if type(jwt_obj.payload.role) == 'table' then
+		for _,v in ipairs(jwt_obj.payload.role) do
+		  if is_in_table(v,conf.roles) then
+			return jwt_obj.reason
+		  end
+		end
+	  end
+  else
+      return 'auth ok'
   end
-  return nil
 end
 
 function JwtOauthPlugin:access(conf)
   JwtOauthPlugin.super.access(self)
+  if kong.request.get_method() == "OPTIONS" then
+    return
+  end
+  if string.match(kong.request.get_path(),'^/.*/health$') then
+    return
+  end
+  if string.match(kong.request.get_path(),'^/health$') then
+    return
+  end
+  if string.match(kong.request.get_path(),'^/.*/swagger') then
+    return
+  end
   public_key = {
 [[-----BEGIN CERTIFICATE-----
-...
+xxxx
 -----END CERTIFICATE-----]],
 [[-----BEGIN CERTIFICATE-----
-MIIDGDCCAgACCQDgKF7gaJXblzANBgkqhkiG9w0BAQsFADBOMQswCQYDVQQGEwJj
-bjELMAkGA1UECAwCZnoxCzAJBgNVBAcMAmZ6MQswCQYDVQQKDAJuZDELMAkGA1UE
-CwwCbmQxCzAJBgNVBAMMAm5kMB4XDTE5MDgzMDAzMjUzNFoXDTI5MDgyNzAzMjUz
-NFowTjELMAkGA1UEBhMCY24xCzAJBgNVBAgMAmZ6MQswCQYDVQQHDAJmejELMAkG
-A1UECgwCbmQxCzAJBgNVBAsMAm5kMQswCQYDVQQDDAJuZDCCASIwDQYJKoZIhvcN
-AQEBBQADggEPADCCAQoCggEBAL3JfNFnfYsCQJNM9qIV/w6SZpNdvUpkndqK4JAF
-lBnXVY4Z8acvxuj0gzJYv+XgifBWiq1HMGoQwSa5ys6qiNjiMhV0T8+l2q/5NhxY
-zttwvw087eB+kxfVlTAs6/8WR039uBdo8vmPCkPIvzENAhpV4Wx6cakEGh9NgVIB
-bbxneUQEOMSYlfl09Uo+wGGkpyF/gtIcjeR7rgjFo/NbR1AVJQWfjPJU1sIZD6Fp
-U0OMxTk7OgWdaPrx0eTSBNRpqToTlsg07w3MocNE4Zt4UJFi9+vq8TcFv9Fk5MRG
-ZW1Ai5KT1ysp6djdISxhmjJPIM7zHmC73sj/yzUjfo/H3p0CAwEAATANBgkqhkiG
-9w0BAQsFAAOCAQEABpO+JT4owKQNpoFDNRlArhEfOgOoLqVk3Yagsz4dGNFwJLz9
-9000NOXBK6vGzuFuafVtdipyLFJYYWrUumeCnMpLuw7+hOG1+JVW07OdQ3M0lqEt
-L2WRtsvXDRODnp5v8RWvPcNrEHn2JtH/Cvfy3ZDKTXPNNQB2f5f7A/jRbNzYMzI4
-3Tin+K9iSxGCZp+vAFG5wg2ahA2YbamEjk+yBCvBaNYkaAHDtmczQF42dYq/gjOy
-p5sYgp+k0sq/poR2hdrKZDklK0kXfSb9bjPucGjxyvxtRW1NmnpvB7dtW5LBCwM5
-Qi7vM4wNj3GCNs+LnbxWWRO+PKoA1KDblfgJbg==
------END CERTIFICATE-----]]}
+...
+-----END CERTIFICATE-----]],}
   local jwt_token,err = retrieve_token(conf)
   if err then
     kong.log.err(err)
@@ -102,7 +137,7 @@ Qi7vM4wNj3GCNs+LnbxWWRO+PKoA1KDblfgJbg==
   for _,v in ipairs(public_key) do
 	local auth_ok,err = do_auth(jwt_token,v,conf)
 	if auth_ok then
-		kong.log.err(auth_ok)
+		--kong.log.err(auth_ok)
 		return
 	end
   end
